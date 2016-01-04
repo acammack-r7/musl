@@ -534,7 +534,7 @@ static void unmap_library(struct dso *dso)
 	}
 }
 
-static void *map_library(int fd, struct dso *dso)
+static void *map_library2(int fd, unsigned char *lib_buf, long lib_buf_sz, struct dso *dso)
 {
 	Ehdr buf[(896+sizeof(Ehdr))/sizeof(Ehdr)];
 	void *allocated_buf=0;
@@ -551,7 +551,14 @@ static void *map_library(int fd, struct dso *dso)
 	size_t tls_image=0;
 	size_t i;
 
-	ssize_t l = read(fd, buf, sizeof buf);
+	ssize_t l;
+
+	if (lib_buf) {
+		l = sizeof(buf) > lib_buf_sz ? lib_buf_sz : sizeof buf;
+		memcpy(buf, lib_buf, l);
+	} else {
+		l = read(fd, buf, sizeof buf);
+	}
 	eh = buf;
 	if (l<0) return 0;
 	if (l<sizeof *eh || (eh->e_type != ET_DYN && eh->e_type != ET_EXEC))
@@ -560,12 +567,22 @@ static void *map_library(int fd, struct dso *dso)
 	if (phsize > sizeof buf - sizeof *eh) {
 		allocated_buf = malloc(phsize);
 		if (!allocated_buf) return 0;
-		l = pread(fd, allocated_buf, phsize, eh->e_phoff);
+		if (lib_buf) {
+			l = phsize;
+			memcpy(allocated_buf, lib_buf + eh->e_phoff, l);
+		} else {
+			l = pread(fd, allocated_buf, phsize, eh->e_phoff);
+		}
 		if (l < 0) goto error;
 		if (l != phsize) goto noexec;
 		ph = ph0 = allocated_buf;
 	} else if (eh->e_phoff + phsize > l) {
-		l = pread(fd, buf+1, phsize, eh->e_phoff);
+		if (lib_buf) {
+			l = phsize;
+			memcpy(buf + 1, lib_buf + eh->e_phoff, l);
+		} else {
+			l = pread(fd, buf+1, phsize, eh->e_phoff);
+		}
 		if (l < 0) goto error;
 		if (l != phsize) goto noexec;
 		ph = ph0 = (void *)(buf + 1);
@@ -647,11 +664,18 @@ static void *map_library(int fd, struct dso *dso)
 	 * the length of the file. This is okay because we will not
 	 * use the invalid part; we just need to reserve the right
 	 * amount of virtual address space to map over later. */
-	map = DL_NOMMU_SUPPORT
-		? mmap((void *)addr_min, map_len, PROT_READ|PROT_WRITE|PROT_EXEC,
-			MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-		: mmap((void *)addr_min, map_len, prot,
-			MAP_PRIVATE, fd, off_start);
+	if (lib_buf) {
+		/* Buffered libraries must to write to the map, file-backed libs don't */
+		map = mmap((void *)addr_min, map_len, prot | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		l = map_len > lib_buf_sz ? lib_buf_sz : map_len;
+		memcpy(map, lib_buf + off_start, l);
+	} else {
+    map = DL_NOMMU_SUPPORT
+      ? mmap((void *)addr_min, map_len, PROT_READ|PROT_WRITE|PROT_EXEC,
+        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+      : mmap((void *)addr_min, map_len, prot,
+        MAP_PRIVATE, fd, off_start);
+	}
 	if (map==MAP_FAILED) goto error;
 	dso->map = map;
 	dso->map_len = map_len;
@@ -684,8 +708,15 @@ static void *map_library(int fd, struct dso *dso)
 		prot = (((ph->p_flags&PF_R) ? PROT_READ : 0) |
 			((ph->p_flags&PF_W) ? PROT_WRITE: 0) |
 			((ph->p_flags&PF_X) ? PROT_EXEC : 0));
-		if (mmap_fixed(base+this_min, this_max-this_min, prot, MAP_PRIVATE|MAP_FIXED, fd, off_start) == MAP_FAILED)
-			goto error;
+		if (lib_buf) {
+			/* Buffered libraries must to write to the map, file-backed libs don't */
+			if (mmap_fixed(base+this_min, this_max-this_min, prot | PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
+				goto error;
+			memcpy(base+this_min, lib_buf + off_start, this_max-this_min);
+		} else {
+			if (mmap_fixed(base+this_min, this_max-this_min, prot, MAP_PRIVATE|MAP_FIXED, fd, off_start) == MAP_FAILED)
+				goto error;
+		}
 		if (ph->p_memsz > ph->p_filesz) {
 			size_t brk = (size_t)base+ph->p_vaddr+ph->p_filesz;
 			size_t pgbrk = brk+PAGE_SIZE-1 & -PAGE_SIZE;
@@ -714,6 +745,11 @@ error:
 	if (map!=MAP_FAILED) unmap_library(dso);
 	free(allocated_buf);
 	return 0;
+}
+
+static void *map_library(int fd, struct dso *dso)
+{
+	return map_library2(fd, NULL, 0, dso);
 }
 
 static int path_open(const char *name, const char *s, char *buf, size_t buf_size)
@@ -886,7 +922,7 @@ static void makefuncdescs(struct dso *p)
 	}
 }
 
-static struct dso *load_library(const char *name, struct dso *needed_by)
+static struct dso *load_library2(const char *name, unsigned char *lib_buf, long lib_buf_sz, struct dso *needed_by)
 {
 	char buf[2*NAME_MAX+2];
 	const char *pathname;
@@ -950,8 +986,8 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 		}
 		if (strlen(name) > NAME_MAX) return 0;
 		fd = -1;
-		if (env_path) fd = path_open(name, env_path, buf, sizeof buf);
-		for (p=needed_by; fd == -1 && p; p=p->needed_by) {
+		if (env_path && !lib_buf) fd = path_open(name, env_path, buf, sizeof buf);
+		for (p=needed_by; fd == -1 && p && !lib_buf; p=p->needed_by) {
 			if (fixup_rpath(p, buf, sizeof buf) < 0)
 				fd = -2; /* Inhibit further search. */
 			if (p->rpath)
@@ -994,25 +1030,29 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 		}
 		pathname = buf;
 	}
-	if (fd < 0) return 0;
-	if (fstat(fd, &st) < 0) {
-		close(fd);
-		return 0;
-	}
-	for (p=head->next; p; p=p->next) {
-		if (p->dev == st.st_dev && p->ino == st.st_ino) {
-			/* If this library was previously loaded with a
-			 * pathname but a search found the same inode,
-			 * setup its shortname so it can be found by name. */
-			if (!p->shortname && pathname != name)
-				p->shortname = strrchr(p->name, '/')+1;
+	if (!lib_buf) {
+		if (fd < 0) return 0;
+		if (fstat(fd, &st) < 0) {
 			close(fd);
-			p->refcnt++;
-			return p;
+			return 0;
 		}
+		for (p=head->next; p; p=p->next) {
+			if (p->dev == st.st_dev && p->ino == st.st_ino) {
+				/* If this library was previously loaded with a
+				 * pathname but a search found the same inode,
+				 * setup its shortname so it can be found by name. */
+				if (!p->shortname && pathname != name)
+					p->shortname = strrchr(p->name, '/')+1;
+				close(fd);
+				p->refcnt++;
+				return p;
+			}
+		}
+		map = noload ? 0 : map_library(fd, &temp_dso);
+		close(fd);
+	} else {
+		map = map_library2(fd, lib_buf, lib_buf_sz, &temp_dso);
 	}
-	map = noload ? 0 : map_library(fd, &temp_dso);
-	close(fd);
 	if (!map) return 0;
 
 	/* Allocate storage for the new DSO. When there is TLS, this
@@ -1073,6 +1113,11 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 	if (ldd_mode) dprintf(1, "\t%s => %s (%p)\n", name, pathname, p->base);
 
 	return p;
+}
+
+static struct dso *load_library(const char *name, struct dso *needed_by)
+{
+	return load_library2(name, NULL, 0, needed_by);
 }
 
 static void load_deps(struct dso *p)
@@ -1640,7 +1685,7 @@ _Noreturn void __dls3(size_t *sp)
 	for(;;);
 }
 
-void *dlopen(const char *file, int mode)
+void *dlopenbuf(const char *file, unsigned char *lib_buf, long lib_buf_sz, int mode)
 {
 	struct dso *volatile p, *orig_tail, *next;
 	struct tls_module *orig_tls_tail;
@@ -1692,7 +1737,7 @@ void *dlopen(const char *file, int mode)
 		tail->next = 0;
 		p = 0;
 		goto end;
-	} else p = load_library(file, head);
+	} else p = load_library2(file, lib_buf, lib_buf_sz, head);
 
 	if (!p) {
 		error(noload ?
@@ -1732,6 +1777,11 @@ end:
 	if (p) do_init_fini(orig_tail);
 	pthread_setcancelstate(cs, 0);
 	return p;
+}
+
+void *dlopen(const char *file, int mode)
+{
+	return dlopenbuf(file, NULL, 0, mode);
 }
 
 __attribute__((__visibility__("hidden")))
